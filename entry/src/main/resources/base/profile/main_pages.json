@@ -1,0 +1,14 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/BleDebugPage",
+    "pages/ChatPage",
+    "pages/ChatListPage",
+    "pages/FlightListPage",
+    "pages/AddFlightPage",
+    "pages/SettingsPage",
+    "pages/ProfilePage",
+    "pages/ChangelogPage",
+    "pages/AboutPage"
+  ]
+}
