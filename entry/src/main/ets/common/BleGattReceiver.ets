@@ -302,6 +302,7 @@ class BleGattReceiverImpl {
   private connected: boolean = false;
   private connectedName: string = '';
   private connectedId: string = '';
+  private centralConnTimer: number = -1;
   private scanning: boolean = false;
   private scanTimer: number = -1;
   private devices: Array<BleDeviceInfo> = [];
@@ -315,8 +316,11 @@ class BleGattReceiverImpl {
   private periphCccdValue: ArrayBuffer = new ArrayBuffer(2);
   private periphDeviceId: string = '';
   private periphPeerName: string = '';
+  private periphConnTimer: number = -1;
   private gattServer: ble.GattServer | null = null;
   private advertising: boolean = false;
+  private lastLog: string = '';
+  private lastLogTime: number = 0;
 
   /**
    * 添加连接状态监听器。监听器将会在连接状态变化时被调用。
@@ -563,20 +567,17 @@ class BleGattReceiverImpl {
         nextConnected = false;
       }
     }
-    if (nextConnected !== this.connected) {
-      this.connected = nextConnected;
-      if (!this.connected) {
-        this.connectedId = '';
-        this.connectedName = '';
-      }
-      this.notify();
-    }
+    this.scheduleCentralConnUpdate(nextConnected);
   };
 
   /**
    * 断开当前连接。
    */
   public disconnect(): void {
+    if (this.centralConnTimer !== -1) {
+      try { clearTimeout(this.centralConnTimer); } catch {}
+      this.centralConnTimer = -1;
+    }
     if (this.client !== null) {
       try {
         this.client.disconnect();
@@ -617,7 +618,7 @@ class BleGattReceiverImpl {
     try {
       server = ble.createGattServer();
       // 日志：创建 GattServer 成功
-      console.info('[BleGattReceiver] createGattServer OK');
+      this.logInfo('[BleGattReceiver] createGattServer OK');
     } catch (e) {
       console.error('[BleGattReceiver] createGattServer failed: ' + String(e));
       return false;
@@ -626,32 +627,32 @@ class BleGattReceiverImpl {
     // 注册服务器回调
     try {
       server.on('connectionStateChange', this.onServerConnChange);
-      console.info('[BleGattReceiver] registered connectionStateChange');
+      this.logInfo('[BleGattReceiver] registered connectionStateChange');
     } catch (e) {
       console.error('[BleGattReceiver] register connectionStateChange failed: ' + String(e));
     }
     try {
       server.on('characteristicWrite', this.onServerCharWrite);
-      console.info('[BleGattReceiver] registered characteristicWrite');
+      this.logInfo('[BleGattReceiver] registered characteristicWrite');
     } catch (e) {
       console.error('[BleGattReceiver] register characteristicWrite failed: ' + String(e));
     }
     try {
       server.on('descriptorRead', this.onServerDescRead);
-      console.info('[BleGattReceiver] registered descriptorRead');
+      this.logInfo('[BleGattReceiver] registered descriptorRead');
     } catch (e) {
       console.error('[BleGattReceiver] register descriptorRead failed: ' + String(e));
     }
     try {
       server.on('descriptorWrite', this.onServerDescWrite);
-      console.info('[BleGattReceiver] registered descriptorWrite');
+      this.logInfo('[BleGattReceiver] registered descriptorWrite');
     } catch (e) {
       console.error('[BleGattReceiver] register descriptorWrite failed: ' + String(e));
     }
     // 添加自定义聊天服务；若失败则关闭服务器
     try {
       this.addChatService(server);
-      console.info('[BleGattReceiver] addChatService OK');
+      this.logInfo('[BleGattReceiver] addChatService OK');
     } catch (e) {
       console.error('[BleGattReceiver] addChatService failed: ' + String(e));
       try { server.close(); } catch {}
@@ -660,7 +661,7 @@ class BleGattReceiverImpl {
     }
     // 尝试启动广播；若失败则关闭服务并返回 false
     const advOk: boolean = this.startAdvertising();
-    console.info('[BleGattReceiver] startAdvertising return ' + String(advOk));
+    this.logInfo('[BleGattReceiver] startAdvertising return ' + String(advOk));
     if (!advOk) {
       try { server.close(); } catch {}
       this.gattServer = null;
@@ -677,6 +678,10 @@ class BleGattReceiverImpl {
   public stopPeripheral(): void {
     if (!this.periphOn) {
       return;
+    }
+    if (this.periphConnTimer !== -1) {
+      try { clearTimeout(this.periphConnTimer); } catch {}
+      this.periphConnTimer = -1;
     }
     this.stopAdvertising();
     if (this.gattServer !== null) {
@@ -737,25 +742,10 @@ class BleGattReceiverImpl {
       }
     }
     if (nextConnected !== this.periphConnected) {
-      this.periphConnected = nextConnected;
-      if (this.periphConnected) {
-        this.periphDeviceId = s.deviceId;
-        // 某些系统版本下，deviceName 或 name 可能为 undefined。使用空字符串兜底，避免 TypeError
-        const devName: string = (s.deviceName && typeof s.deviceName === 'string') ? s.deviceName : '';
-        const altName: string = (s.name && typeof s.name === 'string') ? s.name : '';
-        if (devName.length > 0) {
-          this.periphPeerName = devName;
-        } else if (altName.length > 0) {
-          this.periphPeerName = altName;
-        } else {
-          this.periphPeerName = s.deviceId;
-        }
-      } else {
-        this.periphDeviceId = '';
-        this.periphPeerName = '';
-        this.periphNotifyEnabled = false;
-      }
-      this.notify();
+      const devName: string = (s.deviceName && typeof s.deviceName === 'string') ? s.deviceName : '';
+      const altName: string = (s.name && typeof s.name === 'string') ? s.name : '';
+      const peer: string = devName.length > 0 ? devName : (altName.length > 0 ? altName : s.deviceId);
+      this.schedulePeriphConnUpdate(nextConnected, s.deviceId, peer);
     }
   };
 
@@ -986,6 +976,71 @@ class BleGattReceiverImpl {
       setTimeout(() => {
         this.notifyChunks(chunks, idx + 1);
       }, 30);
+    }
+  }
+
+  /**
+   * 去抖动 Central 连接状态，避免状态 1/3 频繁切换导致 UI 闪烁。
+   */
+  private scheduleCentralConnUpdate(nextConnected: boolean): void {
+    if (this.centralConnTimer !== -1) {
+      try { clearTimeout(this.centralConnTimer); } catch {}
+      this.centralConnTimer = -1;
+    }
+    this.centralConnTimer = setTimeout(() => {
+      this.centralConnTimer = -1;
+      if (this.connected !== nextConnected) {
+        this.connected = nextConnected;
+        if (!this.connected) {
+          this.connectedId = '';
+          this.connectedName = '';
+        }
+        this.notify();
+      }
+    }, 200) as number;
+  }
+
+  /**
+   * 去抖动外设连接状态并在断开时清理订阅状态。
+   */
+  private schedulePeriphConnUpdate(nextConnected: boolean, deviceId: string, peerName: string): void {
+    if (this.periphConnTimer !== -1) {
+      try { clearTimeout(this.periphConnTimer); } catch {}
+      this.periphConnTimer = -1;
+    }
+    this.periphConnTimer = setTimeout(() => {
+      this.periphConnTimer = -1;
+      if (this.periphConnected === nextConnected && this.periphDeviceId === deviceId && this.periphPeerName === peerName) {
+        return;
+      }
+      this.periphConnected = nextConnected;
+      if (this.periphConnected) {
+        this.periphDeviceId = deviceId;
+        this.periphPeerName = peerName;
+      } else {
+        this.periphDeviceId = '';
+        this.periphPeerName = '';
+        this.periphNotifyEnabled = false;
+        this.periphCccdValue = new ArrayBuffer(2);
+      }
+      this.notify();
+    }, 200) as number;
+  }
+
+  /**
+   * 轻量日志：同样内容在 1 秒内只打印一次，避免刷屏。
+   */
+  private logInfo(message: string): void {
+    const now: number = Date.now();
+    if (message === this.lastLog && now - this.lastLogTime < 1000) {
+      return;
+    }
+    this.lastLog = message;
+    this.lastLogTime = now;
+    try {
+      console.info(message);
+    } catch {
+      // ignore
     }
   }
 
